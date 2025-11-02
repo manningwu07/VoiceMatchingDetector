@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/raw/**/*.wav
+data/processed/
+models/*.pt
+models/*.pkl
+outputs/logs/
+outputs/checkpoints/
+.ipynb_checkpoints/
+.env
+*.egg-info/
+dist/
+build/
