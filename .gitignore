@@ -1,4 +1,4 @@
-venv/
+.venv/
 __pycache__/
 *.pyc
 .DS_Store
@@ -13,3 +13,5 @@ outputs/checkpoints/
 *.egg-info/
 dist/
 build/
+
+/src/

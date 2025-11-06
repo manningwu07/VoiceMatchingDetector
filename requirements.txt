@@ -1,0 +1,16 @@
+torch
+torchaudio
+librosa
+speechbrain
+silero-vad
+numpy
+scipy
+scikit-learn
+matplotlib
+seaborn
+pandas
+pyyaml
+tqdm
+julius
+audiomentations
+pyloudnorm
