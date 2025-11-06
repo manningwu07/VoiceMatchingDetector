@@ -13,5 +13,3 @@ outputs/checkpoints/
 *.egg-info/
 dist/
 build/
-
-/src/
