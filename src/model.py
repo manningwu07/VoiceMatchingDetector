@@ -1,46 +1,78 @@
-# src/model.py
 import torch
 import torch.nn as nn
-from speechbrain.pretrained import EncoderClassifier
-from src.config import PRETRAINED_MODEL_NAME, DEVICE, EMBEDDING_DIM
+from speechbrain.inference.speaker import EncoderClassifier
+from sklearn.linear_model import LogisticRegression
+import numpy as np
 
-class SpeakerVerifier(nn.Module):
-    def __init__(self, embedding_dim=EMBEDDING_DIM, hidden_dim=128):
+class VerificationNet(nn.Module):
+    def __init__(self, freeze_encoder=True):
         super().__init__()
+        
+        # 1. Pretrained Encoder (ECAPA-TDNN)
         self.encoder = EncoderClassifier.from_hparams(
-            source=PRETRAINED_MODEL_NAME,
-            run_opts={"device": DEVICE},
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/ecapa"
         )
-        # Freeze encoder
-        for param in self.encoder.parameters():
-            param.requires_grad = False
         
-        # Small head: cosine sim -> logit
+        if freeze_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+
+        # 2. Custom Verification Head (MLP)
+        # Input: Concatenation of (u, v, |u-v|, u*v) -> 192 * 4 features
+        self.embedding_dim = 192
+        input_dim = self.embedding_dim * 4
+        
         self.head = nn.Sequential(
-            nn.Linear(1, hidden_dim),
+            nn.Linear(input_dim, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Dropout(0.3),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1) # Output Logit
         )
-    
-    def forward(self, wav1, wav2):
-        """
-        wav1, wav2: [B, T] audio tensors
-        Returns: logits [B, 1]
-        """
-        with torch.no_grad():
-            emb1 = self.encoder.encode_batch(wav1.to(DEVICE))  # [B, 1, D]
-            emb2 = self.encoder.encode_batch(wav2.to(DEVICE))
+
+    def forward_single(self, x):
+        # ECAPA expects input normalized, creates embedding
+        # We strip the extra batch/time dims to get (B, 192)
+        emb = self.encoder.encode_batch(x)
+        return emb.squeeze(1)
+
+    def forward(self, x1, x2):
+        u = self.forward_single(x1)
+        v = self.forward_single(x2)
         
-        emb1 = torch.nn.functional.normalize(emb1.squeeze(1), dim=-1)  # [B, D]
-        emb2 = torch.nn.functional.normalize(emb2.squeeze(1), dim=-1)
+        # Feature Engineering for the Head
+        # This captures both distance and angle explicitly
+        features = torch.cat([
+            u, 
+            v, 
+            torch.abs(u - v), 
+            u * v
+        ], dim=1)
         
-        cos_sim = torch.sum(emb1 * emb2, dim=-1, keepdim=True)  # [B, 1]
-        logits = self.head(cos_sim)  # [B, 1]
+        logits = self.head(features)
         return logits
 
-def get_embeddings(wav, encoder):
-    """Extract speaker embeddings from wav [T]."""
-    wav_batch = wav.unsqueeze(0)  # [1, T]
-    with torch.no_grad():
-        emb = encoder.encode_batch(wav_batch.to(DEVICE))  # [1, 1, D]
-    return torch.nn.functional.normalize(emb.squeeze().cpu(), dim=0)  # [D]
+class ProbabilityCalibrator:
+    """
+    Post-hoc calibration using Platt Scaling (Logistic Regression).
+    Converts raw logits into well-behaved probabilities.
+    """
+    def __init__(self):
+        self.calibrator = LogisticRegression(C=1.0, solver='lbfgs')
+        self.is_fitted = False
+
+    def fit(self, logits, labels):
+        # Expects logits as numpy array (N, 1) and labels as (N,)
+        self.calibrator.fit(logits.reshape(-1, 1), labels)
+        self.is_fitted = True
+
+    def predict_proba(self, logits):
+        if not self.is_fitted:
+            # Fallback to standard sigmoid if not calibrated yet
+            return 1 / (1 + np.exp(-logits))
+        
+        # Sklearn returns [prob_class_0, prob_class_1]
+        return self.calibrator.predict_proba(logits.reshape(-1, 1))[:, 1]
