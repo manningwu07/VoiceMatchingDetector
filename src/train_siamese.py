@@ -13,9 +13,9 @@ DURATION = 3
 N_MFCC = 80
 MAX_LEN = 130
 
-BATCH_SIZE = 256
-EPOCHS = 10
-PAIRS_PER_EPOCH = 20000
+BATCH_SIZE = 384
+EPOCHS = 300
+PAIRS_PER_EPOCH = 1000 #20000
 CHECKPOINT_PATH = "siamese_checkpoint.keras"
 BEST_MODEL_PATH = "siamese_best.keras"
 
@@ -47,7 +47,7 @@ def preprocess_audio(path):
         return np.zeros((MAX_LEN, N_MFCC), dtype=np.float32)
 
 # --- DATA GENERATOR ---
-def pair_generator(speaker_dict, batch_size=32):
+def pair_generator(speaker_dict, batch_size=32, augment=True):
     speakers = list(speaker_dict.keys())
 
     while True:
@@ -74,11 +74,43 @@ def pair_generator(speaker_dict, batch_size=32):
             feat1 = preprocess_audio(f1)
             feat2 = preprocess_audio(f2)
 
+            # ADD AUGMENTATION
+            if augment:
+                feat1 = augment_mfcc(feat1)
+                feat2 = augment_mfcc(feat2)
+
             x1_batch.append(feat1)
             x2_batch.append(feat2)
             y_batch.append(label)
 
         yield [np.array(x1_batch), np.array(x2_batch)], np.array(y_batch)
+
+def augment_mfcc(mfcc):
+    """Add noise and time-stretch effects to MFCC features"""
+    # 1. Additive Gaussian noise (simulates background noise)
+    if random.random() > 0.7:
+        noise = np.random.randn(*mfcc.shape) * random.uniform(0.01, 0.05)
+        mfcc = mfcc + noise
+    
+    # 2. Time stretch (speaker speaks faster/slower)
+    if random.random() > 0.7:
+        scale = random.uniform(0.95, 1.05)
+        mfcc = mfcc[::int(1/scale), :] if scale > 1.0 else np.repeat(mfcc, int(scale), axis=0)
+        # Re-pad to MAX_LEN
+        if mfcc.shape[0] < MAX_LEN:
+            pad = MAX_LEN - mfcc.shape[0]
+            mfcc = np.pad(mfcc, ((0, pad), (0, 0)))
+        else:
+            mfcc = mfcc[:MAX_LEN, :]
+    
+    # 3. Random frequency masking (block out frequency bands)
+    if random.random() > 0.7:
+        n_mfcc = mfcc.shape[1]
+        mask_start = random.randint(0, n_mfcc - 5)
+        mask_end = mask_start + random.randint(2, 8)
+        mfcc[:, mask_start:mask_end] *= random.uniform(0.1, 0.5)
+    
+    return mfcc.astype(np.float32)
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
@@ -150,6 +182,7 @@ if __name__ == "__main__":
         monitor="val_loss",
         factor=0.5,
         patience=2,
+        min_delta=0.005,
         min_lr=1e-5,
         verbose=1
     )
@@ -157,8 +190,8 @@ if __name__ == "__main__":
     print("\nStarting Training on M4 Pro...")
     try:
         history = siamese_model.fit(
-            pair_generator(train_speakers, BATCH_SIZE),
-            validation_data=pair_generator(val_speakers_dict, BATCH_SIZE),
+            pair_generator(train_speakers, BATCH_SIZE, augment=True),
+            validation_data=pair_generator(val_speakers_dict, BATCH_SIZE, augment=False),
             steps_per_epoch=PAIRS_PER_EPOCH // BATCH_SIZE,
             validation_steps=5000 // BATCH_SIZE,
             epochs=EPOCHS,
