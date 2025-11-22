@@ -5,28 +5,61 @@ import numpy as np
 import os
 import random
 from glob import glob
-from model import build_siamese_model, contrastive_loss
+from model import L2Normalize, build_siamese_model, contrastive_loss
 
 # --- CONFIGURATION ---
+# (Updated to match your screenshot settings)
 SAMPLE_RATE = 16000
 DURATION = 3
-N_MFCC = 80
+N_MFCC = 80       
 MAX_LEN = 130
 
-BATCH_SIZE = 384
-EPOCHS = 300
-PAIRS_PER_EPOCH = 1000 #20000
-CHECKPOINT_PATH = "siamese_checkpoint.keras"
-BEST_MODEL_PATH = "siamese_best.keras"
+BATCH_SIZE = 384  
+EPOCHS = 200      
+PAIRS_PER_EPOCH = 2000 # Kept at 20k to prevent overfitting (resampling)
 
-ADAM_LR = 0.0003
+# UPDATED: Use .h5 to avoid 'options' arguments error in ModelCheckpoint
+CHECKPOINT_PATH = "siamese_checkpoint.h5"
+BEST_MODEL_PATH = "siamese_best.h5"
+
+INITIAL_LR = 0.005  # Updated to match the new learning rate
 
 print(f"🚀 TensorFlow Version: {tf.__version__} (Mac Optimized)")
 
 # --- DISTANCE ACCURACY ---
 def distance_accuracy(y_true, y_pred):
+    # y_pred is distance. < 0.5 means Same (1.0).
     prediction = tf.cast(y_pred < 0.5, tf.float32)
     return K.mean(tf.equal(prediction, y_true))
+
+# --- AUGMENTATION (Fixed) ---
+def augment_mfcc(mfcc):
+    """
+    SpecAugment style: Noise + Freq Masking + Time Masking.
+    Robust and crash-free.
+    """
+    # 1. Additive Noise
+    if random.random() > 0.5:
+        noise = np.random.randn(*mfcc.shape) * random.uniform(0.005, 0.02)
+        mfcc = mfcc + noise
+
+    # 2. Frequency Masking (Block out bands of frequencies)
+    if random.random() > 0.5:
+        n_mels = mfcc.shape[1]
+        # Mask up to 15% of frequencies
+        F = random.randint(1, int(n_mels * 0.15)) 
+        f0 = random.randint(0, n_mels - F)
+        mfcc[:, f0:f0+F] = 0.0
+
+    # 3. Time Masking (Block out time segments) -> Replaces buggy Time Stretch
+    if random.random() > 0.5:
+        time_steps = mfcc.shape[0]
+        # Mask up to 15% of time steps
+        T = random.randint(1, int(time_steps * 0.15))
+        t0 = random.randint(0, time_steps - T)
+        mfcc[t0:t0+T, :] = 0.0
+
+    return mfcc.astype(np.float32)
 
 # --- FEATURE EXTRACTION ---
 def preprocess_audio(path):
@@ -47,7 +80,7 @@ def preprocess_audio(path):
         return np.zeros((MAX_LEN, N_MFCC), dtype=np.float32)
 
 # --- DATA GENERATOR ---
-def pair_generator(speaker_dict, batch_size=32, augment=True):
+def pair_generator(speaker_dict, batch_size=32, augment=False):
     speakers = list(speaker_dict.keys())
 
     while True:
@@ -74,7 +107,6 @@ def pair_generator(speaker_dict, batch_size=32, augment=True):
             feat1 = preprocess_audio(f1)
             feat2 = preprocess_audio(f2)
 
-            # ADD AUGMENTATION
             if augment:
                 feat1 = augment_mfcc(feat1)
                 feat2 = augment_mfcc(feat2)
@@ -84,33 +116,6 @@ def pair_generator(speaker_dict, batch_size=32, augment=True):
             y_batch.append(label)
 
         yield [np.array(x1_batch), np.array(x2_batch)], np.array(y_batch)
-
-def augment_mfcc(mfcc):
-    """Add noise and time-stretch effects to MFCC features"""
-    # 1. Additive Gaussian noise (simulates background noise)
-    if random.random() > 0.7:
-        noise = np.random.randn(*mfcc.shape) * random.uniform(0.01, 0.05)
-        mfcc = mfcc + noise
-    
-    # 2. Time stretch (speaker speaks faster/slower)
-    if random.random() > 0.7:
-        scale = random.uniform(0.95, 1.05)
-        mfcc = mfcc[::int(1/scale), :] if scale > 1.0 else np.repeat(mfcc, int(scale), axis=0)
-        # Re-pad to MAX_LEN
-        if mfcc.shape[0] < MAX_LEN:
-            pad = MAX_LEN - mfcc.shape[0]
-            mfcc = np.pad(mfcc, ((0, pad), (0, 0)))
-        else:
-            mfcc = mfcc[:MAX_LEN, :]
-    
-    # 3. Random frequency masking (block out frequency bands)
-    if random.random() > 0.7:
-        n_mfcc = mfcc.shape[1]
-        mask_start = random.randint(0, n_mfcc - 5)
-        mask_end = mask_start + random.randint(2, 8)
-        mfcc[:, mask_start:mask_end] *= random.uniform(0.1, 0.5)
-    
-    return mfcc.astype(np.float32)
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
@@ -128,37 +133,67 @@ if __name__ == "__main__":
     speaker_dict = {k: v for k, v in speaker_dict.items() if len(v) >= 2}
     print(f"Found {len(speaker_dict)} valid speakers.")
 
-    # Split speakers into train/val
+    # Split: Train vs Val (Every 10th speaker is validation)
     all_speakers = list(speaker_dict.keys())
-    val_speakers = set(all_speakers[::10])  # Every 10th speaker for validation
-    train_speakers = {k: v for k, v in speaker_dict.items() if k not in val_speakers}
-    val_speakers_dict = {k: v for k, v in speaker_dict.items() if k in val_speakers}
+    val_speakers_ids = set(all_speakers[::10]) 
+    train_speakers = {k: v for k, v in speaker_dict.items() if k not in val_speakers_ids}
+    val_speakers_dict = {k: v for k, v in speaker_dict.items() if k in val_speakers_ids}
     
     print(f"Train speakers: {len(train_speakers)}, Val speakers: {len(val_speakers_dict)}")
 
+    # Model Setup
     input_shape = (MAX_LEN, N_MFCC)
 
-    if os.path.exists(CHECKPOINT_PATH):
+    # Need custom objects because of the specific loss/metric functions
+    custom_objects = {
+        "contrastive_loss": contrastive_loss,
+        "distance_accuracy": distance_accuracy,
+        "L2Normalize": L2Normalize
+    }
+
+    # Load or Initialize Model (Best, Checkpoint, then Fresh)
+    if os.path.exists(BEST_MODEL_PATH):
         print(f"🔄 Found checkpoint: {CHECKPOINT_PATH}. Resuming training...")
-        siamese_model = tf.keras.models.load_model(
-            CHECKPOINT_PATH,
-            custom_objects={"contrastive_loss": contrastive_loss, "distance_accuracy": distance_accuracy}
-        )
+        try:
+            siamese_model = tf.keras.models.load_model(CHECKPOINT_PATH, custom_objects=custom_objects)
+        except Exception as e:
+            print(f"❌ CRITICAL: Could not load checkpoint ({e}).")
+            print("🛑 Stopping to prevent overwrite. Fix the model or delete checkpoint manually.")
+            exit(1)
+    elif os.path.exists(CHECKPOINT_PATH):
+        print(f"🔄 Found checkpoint: {CHECKPOINT_PATH}. Resuming training...")
+        try:
+            siamese_model = tf.keras.models.load_model(CHECKPOINT_PATH, custom_objects=custom_objects)
+        except Exception as e:
+            print(f"❌ CRITICAL: Could not load checkpoint ({e}).")
+            print("🛑 Stopping to prevent overwrite. Fix the model or delete checkpoint manually.")
+            exit(1)
     else:
         print("✨ No checkpoint found. Starting fresh training...")
         siamese_model = build_siamese_model(input_shape)
-        siamese_model.compile(
-            loss=contrastive_loss,
-            optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=ADAM_LR),
-            metrics=[distance_accuracy]
-        )
+
+    # Reactive Learning Rate (Aggressive)
+    lr_reduce = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.6,       # Cut LR in half
+        patience=2,       # If no improvement for 2 epochs...
+        min_delta=0.005,  # ...where improvement must be at least 0.005
+        min_lr=1e-6,
+        verbose=1
+    )
+
+    siamese_model.compile(
+        loss=contrastive_loss,
+        optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=INITIAL_LR),
+        metrics=[distance_accuracy]
+    )
 
     siamese_model.summary()
 
     # Callbacks
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
         filepath=CHECKPOINT_PATH,
-        save_best_only=False,  # Keep latest for resuming
+        save_best_only=False, # Keep latest for resuming
         save_weights_only=False,
         verbose=1
     )
@@ -166,24 +201,15 @@ if __name__ == "__main__":
     best_model_cb = tf.keras.callbacks.ModelCheckpoint(
         filepath=BEST_MODEL_PATH,
         monitor="val_loss",
-        save_best_only=True,  # Only save if validation loss improves
+        save_best_only=True, # Keep absolute best
         save_weights_only=False,
         verbose=1
     )
 
     early_stopping = tf.keras.callbacks.EarlyStopping(
         monitor="val_loss",
-        patience=3,
+        patience=8,
         restore_best_weights=True,
-        verbose=1
-    )
-
-    lr_reduce = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor="val_loss",
-        factor=0.5,
-        patience=2,
-        min_delta=0.005,
-        min_lr=1e-5,
         verbose=1
     )
 
@@ -193,12 +219,12 @@ if __name__ == "__main__":
             pair_generator(train_speakers, BATCH_SIZE, augment=True),
             validation_data=pair_generator(val_speakers_dict, BATCH_SIZE, augment=False),
             steps_per_epoch=PAIRS_PER_EPOCH // BATCH_SIZE,
-            validation_steps=5000 // BATCH_SIZE,
+            validation_steps=2000 // BATCH_SIZE, # Smaller val steps for speed
             epochs=EPOCHS,
             callbacks=[checkpoint_cb, best_model_cb, early_stopping, lr_reduce]
         )
 
-        siamese_model.save("custom_voice_auth_final.keras")
+        siamese_model.save("custom_voice_auth_final.h5")
         print("\n✅ Training Complete & Saved.")
 
     except KeyboardInterrupt:

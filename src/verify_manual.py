@@ -1,6 +1,6 @@
 import tensorflow as tf
 import numpy as np
-from model import contrastive_loss, distance_accuracy
+from model import L2Normalize, contrastive_loss, distance_accuracy
 import librosa
 import sys
 
@@ -20,10 +20,11 @@ def preprocess(path):
 def verify(path1, path2, threshold=0.5):
     print(f"Loading best model...")
     model = tf.keras.models.load_model(
-        "siamese_best.keras", 
+        "siamese_best.h5", 
         custom_objects={
             "contrastive_loss": contrastive_loss,
-            "distance_accuracy": distance_accuracy
+            "distance_accuracy": distance_accuracy,
+            "L2Normalize": L2Normalize 
         }
     )
     

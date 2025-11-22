@@ -3,6 +3,20 @@ import tensorflow.keras.layers as layers
 import tensorflow.keras.models as models
 import tensorflow.keras.backend as K
 
+# --- CUSTOM LAYER (Replaces Lambda for safe serialization) ---
+class L2Normalize(layers.Layer):
+    def __init__(self, axis=1, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, x):
+        return K.l2_normalize(x, axis=self.axis)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"axis": self.axis})
+        return config
+
 def contrastive_loss(y_true, y_pred, margin=1.0):
     y_true = tf.cast(y_true, tf.float32)
     sq = K.square(y_pred)
@@ -13,10 +27,6 @@ def euclidean_distance(vectors):
     a, b = vectors
     sum_sq = K.sum(K.square(a - b), axis=1, keepdims=True)
     return K.sqrt(K.maximum(sum_sq, K.epsilon()))
-
-def l2_normalize_layer(v):
-    """Named function for L2 normalization (serializable)"""
-    return K.l2_normalize(v, axis=1)
 
 def build_base_network(input_shape):
     inputs = layers.Input(shape=input_shape)
@@ -43,7 +53,10 @@ def build_base_network(input_shape):
 
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(128, activation=None)(x)
-    x = layers.Lambda(l2_normalize_layer, name="l2_norm")(x)  # ← Now named function
+    
+    # UPDATED: Use class instead of Lambda
+    x = L2Normalize(name="l2_norm")(x)
+    
     return models.Model(inputs, x, name="Shared_Encoder")
 
 def build_siamese_model(input_shape):
@@ -59,13 +72,5 @@ def build_siamese_model(input_shape):
 
 # --- METRICS ---
 def distance_accuracy(y_true, y_pred):
-    """
-    y_true: 1 for same, 0 for different
-    y_pred: distance
-    
-    If distance < 0.5, we predict "same" (1).
-    If distance > 0.5, we predict "different" (0).
-    """
-    # cast boolean (dist < 0.5) to float (1.0 or 0.0)
     prediction = tf.cast(y_pred < 0.5, tf.float32)
     return K.mean(tf.equal(prediction, y_true))
