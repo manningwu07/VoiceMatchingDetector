@@ -1,11 +1,11 @@
 import tensorflow as tf
-import librosa
 import numpy as np
+from model import contrastive_loss, distance_accuracy
+import librosa
 import sys
 
-# Constants (Must match training)
 SAMPLE_RATE = 16000
-N_MFCC = 40
+N_MFCC = 80
 MAX_LEN = 130
 
 def preprocess(path):
@@ -15,33 +15,34 @@ def preprocess(path):
         mfcc = np.pad(mfcc, ((0, MAX_LEN - mfcc.shape[0]), (0, 0)))
     else:
         mfcc = mfcc[:MAX_LEN, :]
-    return mfcc[np.newaxis, ...] # Add batch dim
+    return mfcc[np.newaxis, ...]
 
-def verify(path1, path2):
-    print(f"Loading model...")
-    model = tf.keras.models.load_model("custom_voice_auth.keras")
+def verify(path1, path2, threshold=0.5):
+    print(f"Loading best model...")
+    model = tf.keras.models.load_model(
+        "siamese_best.keras", 
+        custom_objects={
+            "contrastive_loss": contrastive_loss,
+            "distance_accuracy": distance_accuracy
+        }
+    )
     
     print(f"Processing audio...")
     f1 = preprocess(path1)
     f2 = preprocess(path2)
     
     print(f"Predicting...")
-    # Prediction is probability of being the SAME person (0-1)
-    score = model.predict([f1, f2], verbose=0)[0][0]
+    distance = float(model.predict([f1, f2], verbose=0)[0][0])
     
-    # In our specific architecture (Euclidean Distance -> Dense -> Sigmoid), 
-    # If the Dense weights are negative (common), high distance = low score (0).
-    # Low distance = high score (1).
-    
-    print(f"\n🔍 Similarity Score: {score:.4f}")
-    if score > 0.5:
+    print(f"\n🔍 Distance: {distance:.4f}")
+    if distance < threshold:
         print("✅ SAME PERSON")
     else:
         print("❌ DIFFERENT PEOPLE")
 
 if __name__ == "__main__":
-    # Usage: python3 verify_manual.py file1.wav file2.wav
     if len(sys.argv) < 3:
-        print("Usage: python3 verify_manual.py <file1> <file2>")
+        print("Usage: python3 verify_manual.py <file1> <file2> [threshold]")
     else:
-        verify(sys.argv[1], sys.argv[2])
+        threshold = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5
+        verify(sys.argv[1], sys.argv[2], threshold)
