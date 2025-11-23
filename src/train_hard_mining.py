@@ -14,7 +14,7 @@ BATCH_SIZE = 64
 EPOCHS = 30       
 STEPS_PER_EPOCH = 150
 
-LOAD_PATH = "ecapa_final_armored.h5" 
+LOAD_PATH = "ecapa_master.h5" 
 SAVE_PATH = "ecapa_hard_mining.h5"
 LR = 2e-6  # Prevent NaNs with very low LR
 
