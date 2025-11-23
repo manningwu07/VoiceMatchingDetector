@@ -137,7 +137,7 @@ if __name__ == "__main__":
     
     # Adjusted contrastive loss margin
     def relaxed_contrastive_loss(y_true, y_pred):
-        return contrastive_loss(y_true, y_pred, margin=0.5)
+        return contrastive_loss(y_true, y_pred, margin=1.0)
 
     model.compile(
         loss=relaxed_contrastive_loss,
