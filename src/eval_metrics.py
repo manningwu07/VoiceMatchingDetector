@@ -3,11 +3,7 @@ import numpy as np
 import librosa
 import os
 import random
-from glob import glob
 from tqdm import tqdm
-
-# Import the architecture definition explicitly
-# This prevents the "NameError: K is not defined" because the code runs here
 from model import build_siamese_model
 
 # --- CONFIG ---
@@ -16,43 +12,48 @@ N_MFCC = 80
 MAX_LEN = 130
 BATCH_SIZE = 64
 
-def preprocess(path):
+def preprocess_tta(path):
+    """Returns a batch of variations for a single file"""
     try:
-        y, _ = librosa.load(path, sr=SAMPLE_RATE)
-        # Trim and Pad
-        y, _ = librosa.effects.trim(y, top_db=20)
-        target = int(SAMPLE_RATE * 3.0)
-        if len(y) > target:
-            start = (len(y) - target) // 2
-            y = y[start:start+target]
-        else:
-            y = np.pad(y, (0, target - len(y)))
-            
-        mfcc = librosa.feature.mfcc(y=y, sr=SAMPLE_RATE, n_mfcc=N_MFCC).T
-        mfcc = (mfcc - np.mean(mfcc, axis=0)) / (np.std(mfcc, axis=0) + 1e-8)
+        y_raw, _ = librosa.load(path, sr=SAMPLE_RATE)
+        y_raw, _ = librosa.effects.trim(y_raw, top_db=20)
         
-        if mfcc.shape[0] < MAX_LEN:
-            mfcc = np.pad(mfcc, ((0, MAX_LEN - mfcc.shape[0]), (0, 0)))
+        # 1. Base crop (Center)
+        target = int(SAMPLE_RATE * 3.0)
+        if len(y_raw) > target:
+            start = (len(y_raw) - target) // 2
+            y_base = y_raw[start:start+target]
         else:
-            mfcc = mfcc[:MAX_LEN, :]
-        return mfcc.astype(np.float32)
+            y_base = np.pad(y_raw, (0, target - len(y_raw)))
+
+        # 2. Shifted crop (Random offset)
+        if len(y_raw) > target:
+            start = random.randint(0, len(y_raw) - target)
+            y_shift = y_raw[start:start+target]
+        else:
+            y_shift = y_base # Fallback
+
+        batch = []
+        for y in [y_base, y_shift]:
+            # MFCC
+            mfcc = librosa.feature.mfcc(y=y, sr=SAMPLE_RATE, n_mfcc=N_MFCC).T
+            # Instance Norm
+            mfcc = (mfcc - np.mean(mfcc, axis=0)) / (np.std(mfcc, axis=0) + 1e-8)
+            
+            if mfcc.shape[0] < MAX_LEN:
+                mfcc = np.pad(mfcc, ((0, MAX_LEN - mfcc.shape[0]), (0, 0)))
+            else:
+                mfcc = mfcc[:MAX_LEN, :]
+            batch.append(mfcc)
+            
+        return np.array(batch, dtype=np.float32)
     except:
-        return np.zeros((MAX_LEN, N_MFCC), dtype=np.float32)
+        return np.zeros((2, MAX_LEN, N_MFCC), dtype=np.float32)
 
 def evaluate(model_path, data_dir, num_pairs=2000):
-    print(f"🏗️  Reconstructing Model Architecture...")
-    # 1. Build the model structure from code (Safe way)
+    print(f"🏗️  Reconstructing Model...")
     full_model = build_siamese_model((MAX_LEN, N_MFCC))
-    
-    print(f"🔄 Loading Weights from {model_path}...")
-    # 2. Load just the weights (Bypasses the Lambda deserialization error)
-    # Note: We need by_name=True or skip_mismatch just in case, but usually standard load works
-    try:
-        full_model.load_weights(model_path)
-    except Exception as e:
-        print(f"Weight loading warning (might be fine if shapes match): {e}")
-
-    # 3. Extract Encoder
+    full_model.load_weights(model_path)
     encoder = full_model.get_layer("ECAPA_Encoder")
     
     print("📂 Indexing Speakers...")
@@ -66,15 +67,13 @@ def evaluate(model_path, data_dir, num_pairs=2000):
     
     speaker_dict = {k: v for k, v in speaker_dict.items() if len(v) >= 2}
     speakers = list(speaker_dict.keys())
-    
-    # Validation Set (Last 10%)
     val_keys = speakers[::10]
-    print(f"🧪 Testing on {len(val_keys)} speakers ({num_pairs} pairs)...")
+    
+    print(f"🧪 Testing on {len(val_keys)} speakers ({num_pairs} pairs) using TTA...")
     
     dists = []
     labels = []
     
-    print("⚡ Generating Embeddings & Calculating Distances...")
     for _ in tqdm(range(num_pairs)):
         is_same = random.random() > 0.5
         if is_same:
@@ -88,11 +87,21 @@ def evaluate(model_path, data_dir, num_pairs=2000):
             f2 = random.choice(speaker_dict[s2])
             label = 0
             
-        inp1 = preprocess(f1)[np.newaxis, ...]
-        inp2 = preprocess(f2)[np.newaxis, ...]
+        # Get TTA batches (shape: [2, 130, 80])
+        inp1 = preprocess_tta(f1)
+        inp2 = preprocess_tta(f2)
         
-        v1 = encoder.predict(inp1, verbose=0)
-        v2 = encoder.predict(inp2, verbose=0)
+        # Predict on batch
+        v1_batch = encoder.predict(inp1, verbose=0)
+        v2_batch = encoder.predict(inp2, verbose=0)
+        
+        # Average the embeddings (The Magic Step)
+        v1 = np.mean(v1_batch, axis=0)
+        v2 = np.mean(v2_batch, axis=0)
+        
+        # Re-normalize after averaging
+        v1 = v1 / np.linalg.norm(v1)
+        v2 = v2 / np.linalg.norm(v2)
         
         dist = np.linalg.norm(v1 - v2)
         dists.append(dist)
@@ -101,11 +110,8 @@ def evaluate(model_path, data_dir, num_pairs=2000):
     # --- Find Best Threshold ---
     dists = np.array(dists)
     labels = np.array(labels)
-    
     best_acc = 0
     best_thresh = 0
-    
-    # Scan thresholds
     for t in np.arange(0.1, 1.5, 0.05):
         preds = (dists < t).astype(int)
         acc = np.mean(preds == labels)
@@ -114,7 +120,7 @@ def evaluate(model_path, data_dir, num_pairs=2000):
             best_thresh = t
             
     print("\n" + "="*30)
-    print(f"🏆 FINAL RESULTS")
+    print(f"🏆 FINAL TTA RESULTS")
     print(f"✅ Best Accuracy: {best_acc*100:.2f}%")
     print(f"⚖️ Optimal Threshold: {best_thresh:.2f}")
     print("="*30)
