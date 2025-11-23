@@ -10,13 +10,13 @@ SAMPLE_RATE = 16000
 DURATION = 3.0
 N_MFCC = 80       
 MAX_LEN = 130     
-BATCH_SIZE = 64   # Reduced to 64 for stability during hard mining
+BATCH_SIZE = 64   
 EPOCHS = 30       
 STEPS_PER_EPOCH = 150
 
 LOAD_PATH = "ecapa_final_armored.h5" 
-SAVE_PATH = "ecapa_hard_mining_fixed.h5"
-LR = 3e-6         # SUPER LOW LR to prevent collapse
+SAVE_PATH = "ecapa_hard_mining.h5"
+LR = 2e-6  # Prevent NaNs with very low LR
 
 # --- DATA ---
 def augment_audio(y, sr):
@@ -45,6 +45,10 @@ def preprocess(path, augment=False):
             mfcc = np.pad(mfcc, ((0, MAX_LEN - mfcc.shape[0]), (0, 0)))
         else:
             mfcc = mfcc[:MAX_LEN, :]
+            
+        # SAFETY: Check for NaNs in input
+        if np.isnan(mfcc).any(): return None
+        
         return mfcc.astype(np.float32)
     except:
         return None
@@ -61,7 +65,7 @@ def get_speaker_data():
                 speaker_dict[spk].append(os.path.join(root, f))
     return {k:v for k,v in speaker_dict.items() if len(v) >= 2}
 
-# --- MODEL ---
+# --- BULLETPROOF MODEL ---
 class HardMiningModel(tf.keras.Model):
     def __init__(self, base_model, margin=1.0):
         super().__init__()
@@ -81,55 +85,58 @@ class HardMiningModel(tf.keras.Model):
             anc_emb = self.encoder(anchors, training=True)
             pos_emb = self.encoder(positives, training=True)
             
-            # --- Batch Hard Logic ---
-            # 1. Pos Dist
+            # Distance Matrix
             pos_dist = tf.reduce_sum(tf.square(anc_emb - pos_emb), axis=1)
             
-            # 2. Neg Dist (All vs All)
             cross_dot = tf.matmul(anc_emb, tf.transpose(pos_emb))
             anc_sq = tf.reduce_sum(tf.square(anc_emb), axis=1, keepdims=True)
             pos_sq = tf.reduce_sum(tf.square(pos_emb), axis=1, keepdims=True)
             cross_dist = anc_sq - 2.0 * cross_dot + tf.transpose(pos_sq)
             cross_dist = tf.maximum(cross_dist, 0.0)
             
-            # Mask diagonal (Self)
             batch_size = tf.shape(anchors)[0]
             diag_mask = tf.eye(batch_size) * 1e9
             masked_neg_dist = cross_dist + diag_mask
             
-            # Hardest Negative
             hardest_neg_dist = tf.reduce_min(masked_neg_dist, axis=1)
             
-            # Loss
             loss = tf.maximum(pos_dist - hardest_neg_dist + self.margin, 0.0)
             loss = tf.reduce_mean(loss)
 
-        # Gradient Clipping to prevent Collapse
+        # --- CIRCUIT BREAKER ---
+        if tf.math.is_nan(loss):
+            print("\n⚠️ NaN detected in loss! Skipping batch to save weights.")
+            return {"loss": self.loss_tracker.result()}
+            
         grads = tape.gradient(loss, self.encoder.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.encoder.trainable_weights))
+        
+        # --- GRADIENT CHECK ---
+        # If any gradient is NaN, skip update
+        has_nan_grad = False
+        for g in grads:
+            if g is not None and tf.reduce_any(tf.math.is_nan(g)):
+                has_nan_grad = True
+                break
+        
+        if not has_nan_grad:
+            self.optimizer.apply_gradients(zip(grads, self.encoder.trainable_weights))
+            self.loss_tracker.update_state(loss)
+        else:
+            print("\n⚠️ NaN detected in gradients! Skipping update.")
 
-        self.loss_tracker.update_state(loss)
         return {"loss": self.loss_tracker.result()}
 
     def test_step(self, data):
-        # REAL VALIDATION: Check both Positive and Negative pairs
         anchors, positives = data[0], data[1]
-        
         anc_emb = self.encoder(anchors, training=False)
         pos_emb = self.encoder(positives, training=False)
         
-        # 1. Positive Distance (Should be small)
         pos_dist = tf.reduce_sum(tf.square(anc_emb - pos_emb), axis=1)
-        
-        # 2. Negative Distance (Should be large)
-        # We shift positives by 1 to create artificial negatives
         neg_emb = tf.roll(pos_emb, shift=1, axis=0) 
         neg_dist = tf.reduce_sum(tf.square(anc_emb - neg_emb), axis=1)
         
-        # Accuracy: How often is Pos < Neg?
         correct = tf.cast(pos_dist < neg_dist, tf.float32)
         self.acc_tracker.update_state(correct)
-        
         return {"val_acc": self.acc_tracker.result()}
 
 # --- GENERATOR ---
@@ -153,7 +160,7 @@ def pair_generator(speaker_dict, batch_size=64):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print(f"🔥 Starting Stabilized Hard Mining from: {LOAD_PATH}")
+    print(f"🔥 Starting BULLETPROOF Hard Mining from: {LOAD_PATH}")
     
     full_model = build_siamese_model((MAX_LEN, N_MFCC))
     try:
@@ -163,10 +170,16 @@ if __name__ == "__main__":
         print("❌ CRITICAL: No weights found. Stop.")
         exit()
 
-    mining_model = HardMiningModel(full_model, margin=0.6) # Gentle Margin
+    mining_model = HardMiningModel(full_model, margin=0.6)
     
-    # CLIPNORM IS CRITICAL HERE
-    mining_model.compile(optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=LR, clipnorm=1.0))
+    # SAFETY OPTIMIZER
+    mining_model.compile(
+        optimizer=tf.keras.optimizers.legacy.Adam(
+            learning_rate=LR, 
+            clipnorm=1.0,   # Caps global vector length
+            clipvalue=0.5   # Caps individual gradients
+        )
+    )
 
     spk_dict = get_speaker_data()
     keys = sorted(list(spk_dict.keys()))
@@ -192,11 +205,17 @@ if __name__ == "__main__":
     mining_model.fit(
         train_ds,
         validation_data=val_ds,
-        validation_steps=50,
+        validation_steps=20,
         steps_per_epoch=STEPS_PER_EPOCH,
         epochs=EPOCHS,
         callbacks=[
-            tf.keras.callbacks.ModelCheckpoint(SAVE_PATH, save_best_only=True, monitor='val_acc', verbose=1, save_weights_only=True)
+            tf.keras.callbacks.ModelCheckpoint(
+                SAVE_PATH, 
+                save_best_only=True, 
+                monitor='val_val_acc', # CORRECT NAME
+                verbose=1, 
+                save_weights_only=True
+            )
         ]
     )
     print("✅ Done.")
