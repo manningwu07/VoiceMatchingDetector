@@ -13,31 +13,23 @@ class L2Normalize(layers.Layer):
     def get_config(self):
         return super().get_config() | {"axis": self.axis}
 
-def euclidean_distance(vectors):
-    a, b = vectors
-    # Added K.epsilon() inside sqrt is standard, but let's be safer
-    sum_sq = K.sum(K.square(a - b), axis=1, keepdims=True)
-    return K.sqrt(K.maximum(sum_sq, K.epsilon()))
+# --- TRIPLET LOSS ---
+# This is computed inside the model structure for easier Keras integration
+def triplet_loss(inputs, margin=1.0):
+    anchor, positive, negative = inputs
+    
+    # Distance(Anchor, Positive)
+    pos_dist = K.sum(K.square(anchor - positive), axis=1)
+    
+    # Distance(Anchor, Negative)
+    neg_dist = K.sum(K.square(anchor - negative), axis=1)
+    
+    # Loss: max(pos_dist - neg_dist + margin, 0)
+    basic_loss = pos_dist - neg_dist + margin
+    loss = K.maximum(basic_loss, 0.0)
+    return loss
 
-# --- ROBUST CONTRASTIVE LOSS ---
-def contrastive_loss(y_true, y_pred, margin=1.0):
-    y_true = tf.cast(y_true, tf.float32)
-    
-    # 1. Squared Distance
-    sq_pred = K.square(y_pred)
-    
-    # 2. Positive Loss (Pull together)
-    # We add a small regularizer to prevent total collapse to 0
-    pos_loss = sq_pred
-    
-    # 3. Negative Loss (Push apart)
-    # The margin logic: if dist > margin, loss is 0.
-    neg_loss = K.square(K.maximum(margin - y_pred, 0.0))
-    
-    # 4. Total
-    return K.mean(y_true * pos_loss + (1.0 - y_true) * neg_loss)
-
-# --- ECAPA-TDNN BLOCKS (Same as before) ---
+# --- ECAPA-TDNN BLOCKS (UNCHANGED) ---
 def se_block(x, filters, ratio=8):
     s = layers.GlobalAveragePooling1D()(x)
     s = layers.Reshape((1, filters))(s)
@@ -64,45 +56,60 @@ def res2net_block(x, filters, kernel_size, dilation, scale=4):
 def build_base_network(input_shape):
     inputs = layers.Input(shape=input_shape)
     
-    # Initial Feature Extraction
     x = layers.Conv1D(128, 5, strides=1, padding='same')(inputs)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('relu')(x)
 
-    # ECAPA Blocks
     x1 = res2net_block(x, 128, kernel_size=3, dilation=2)
     x2 = res2net_block(x1, 128, kernel_size=3, dilation=3)
     x3 = res2net_block(x2, 128, kernel_size=3, dilation=4)
 
-    # Aggregation
     x = layers.Concatenate()([x1, x2, x3])
     x = layers.Conv1D(256, 1, padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('relu')(x)
 
-    # Pooling
     mean = layers.GlobalAveragePooling1D()(x)
     max_p = layers.GlobalMaxPooling1D()(x)
     std = layers.Lambda(lambda t: K.std(t, axis=1))(x)
     x = layers.Concatenate()([mean, max_p, std])
     
-    # Embedding Head
     x = layers.Dense(192, activation=None)(x)
     x = layers.BatchNormalization()(x)
-    
-    # CRITICAL: We enforce L2 Normalize. 
-    # If the inputs to this are all zero, it outputs NaNs or Zeros.
-    # We add a small epsilon inside the normalization layer just in case,
-    # but strictly speaking K.l2_normalize handles it.
     x = L2Normalize(name="l2_norm")(x)
     
     return models.Model(inputs, x, name="ECAPA_Encoder")
 
+
 def build_siamese_model(input_shape):
-    inp_a = layers.Input(shape=input_shape, name="Input_A")
-    inp_b = layers.Input(shape=input_shape, name="Input_B")
+    # Triplet Inputs
+    inp_a = layers.Input(shape=input_shape, name="Anchor")
+    inp_p = layers.Input(shape=input_shape, name="Positive")
+    inp_n = layers.Input(shape=input_shape, name="Negative")
+
     base = build_base_network(input_shape)
-    fa = base(inp_a)
-    fb = base(inp_b)
-    dist = layers.Lambda(euclidean_distance, name="distance")([fa, fb])
-    return models.Model([inp_a, inp_b], dist, name="SiameseECAPA")
+    
+    emb_a = base(inp_a)
+    emb_p = base(inp_p)
+    emb_n = base(inp_n)
+
+    # --- Calculations inside the graph ---
+    # 1. Calculate Distances
+    pos_dist = K.sum(K.square(emb_a - emb_p), axis=1)
+    neg_dist = K.sum(K.square(emb_a - emb_n), axis=1)
+    
+    # 2. Calculate Loss (Margin 1.0)
+    basic_loss = pos_dist - neg_dist + 1.0
+    loss = K.maximum(basic_loss, 0.0)
+    
+    # 3. Calculate Accuracy (Is Positive closer than Negative?)
+    # If pos_dist < neg_dist, then we successfully identified the speaker.
+    accuracy = K.mean(K.cast(pos_dist < neg_dist, tf.float32))
+    
+    # Construct Model
+    model = models.Model([inp_a, inp_p, inp_n], loss, name="TripletModel")
+    
+    # 4. Inject the Metric
+    model.add_metric(accuracy, name="triplet_accuracy")
+    
+    return model
