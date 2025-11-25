@@ -11,12 +11,12 @@ DURATION = 3.0
 N_MFCC = 80       
 MAX_LEN = 130     
 BATCH_SIZE = 64   
-EPOCHS = 30       
+EPOCHS = 10       
 STEPS_PER_EPOCH = 150
 
-LOAD_PATH = "ecapa_master.h5" 
-SAVE_PATH = "ecapa_hard_mining.h5"
-LR = 2e-6  # Prevent NaNs with very low LR
+LOAD_PATH = "ecapa_hard_mining.h5"  # <--- LOAD THE 92.4% MODEL
+SAVE_PATH = "ecapa_squeezed.h5"     # <--- New save file
+LR = 1e-7                           # <--- The Squeeze (10x smaller)
 
 # --- DATA ---
 def augment_audio(y, sr):
@@ -46,9 +46,7 @@ def preprocess(path, augment=False):
         else:
             mfcc = mfcc[:MAX_LEN, :]
             
-        # SAFETY: Check for NaNs in input
         if np.isnan(mfcc).any(): return None
-        
         return mfcc.astype(np.float32)
     except:
         return None
@@ -65,7 +63,7 @@ def get_speaker_data():
                 speaker_dict[spk].append(os.path.join(root, f))
     return {k:v for k,v in speaker_dict.items() if len(v) >= 2}
 
-# --- BULLETPROOF MODEL ---
+# --- MODEL CLASS ---
 class HardMiningModel(tf.keras.Model):
     def __init__(self, base_model, margin=1.0):
         super().__init__()
@@ -85,7 +83,7 @@ class HardMiningModel(tf.keras.Model):
             anc_emb = self.encoder(anchors, training=True)
             pos_emb = self.encoder(positives, training=True)
             
-            # Distance Matrix
+            # --- Hard Mining Calculations ---
             pos_dist = tf.reduce_sum(tf.square(anc_emb - pos_emb), axis=1)
             
             cross_dot = tf.matmul(anc_emb, tf.transpose(pos_emb))
@@ -103,26 +101,23 @@ class HardMiningModel(tf.keras.Model):
             loss = tf.maximum(pos_dist - hardest_neg_dist + self.margin, 0.0)
             loss = tf.reduce_mean(loss)
 
-        # --- CIRCUIT BREAKER ---
-        if tf.math.is_nan(loss):
-            print("\n⚠️ NaN detected in loss! Skipping batch to save weights.")
-            return {"loss": self.loss_tracker.result()}
-            
+        # --- GRAPH-SAFE UPDATE ---
         grads = tape.gradient(loss, self.encoder.trainable_weights)
         
-        # --- GRADIENT CHECK ---
-        # If any gradient is NaN, skip update
-        has_nan_grad = False
-        for g in grads:
-            if g is not None and tf.reduce_any(tf.math.is_nan(g)):
-                has_nan_grad = True
-                break
-        
-        if not has_nan_grad:
+        # Check for NaN in Loss (using tf.cond instead of Python if)
+        is_nan_loss = tf.math.is_nan(loss)
+
+        def apply_grads():
             self.optimizer.apply_gradients(zip(grads, self.encoder.trainable_weights))
             self.loss_tracker.update_state(loss)
-        else:
-            print("\n⚠️ NaN detected in gradients! Skipping update.")
+            return tf.constant(0.0) # Dummy return required by tf.cond
+
+        def skip_grads():
+            tf.print("⚠️ NaN Loss detected - Skipping batch")
+            return tf.constant(0.0)
+
+        # If loss is NaN, skip. Else, apply.
+        tf.cond(is_nan_loss, skip_grads, apply_grads)
 
         return {"loss": self.loss_tracker.result()}
 
@@ -160,7 +155,7 @@ def pair_generator(speaker_dict, batch_size=64):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print(f"🔥 Starting BULLETPROOF Hard Mining from: {LOAD_PATH}")
+    print(f"🔥 Starting Graph-Safe Hard Mining from: {LOAD_PATH}")
     
     full_model = build_siamese_model((MAX_LEN, N_MFCC))
     try:
@@ -172,12 +167,12 @@ if __name__ == "__main__":
 
     mining_model = HardMiningModel(full_model, margin=0.6)
     
-    # SAFETY OPTIMIZER
+    # SAFETY OPTIMIZER (ClipNorm prevents explosions)
     mining_model.compile(
         optimizer=tf.keras.optimizers.legacy.Adam(
             learning_rate=LR, 
-            clipnorm=1.0,   # Caps global vector length
-            clipvalue=0.5   # Caps individual gradients
+            clipnorm=1.0, 
+            clipvalue=0.5
         )
     )
 
@@ -212,7 +207,7 @@ if __name__ == "__main__":
             tf.keras.callbacks.ModelCheckpoint(
                 SAVE_PATH, 
                 save_best_only=True, 
-                monitor='val_val_acc', # CORRECT NAME
+                monitor='val_val_acc', # Ensure this matches logs
                 verbose=1, 
                 save_weights_only=True
             )

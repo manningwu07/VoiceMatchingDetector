@@ -126,4 +126,4 @@ def evaluate(model_path, data_dir, num_pairs=2000):
     print("="*30)
 
 if __name__ == "__main__":
-    evaluate("ecapa_final_armored.h5", "./data/LibriSpeech/train-clean-360")
+    evaluate("ecapa_hard_mining.h5", "./data/LibriSpeech/train-clean-360")

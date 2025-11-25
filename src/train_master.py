@@ -3,178 +3,287 @@ import numpy as np
 import os
 import random
 import librosa
-import sys
-from model import build_siamese_model, L2Normalize
+from model import build_siamese_model 
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 SAMPLE_RATE = 16000
 DURATION = 3.0
 N_MFCC = 80       
 MAX_LEN = 130     
-BATCH_SIZE = 64
-EPOCHS = 100      
-PAIRS_PER_EPOCH = 10000
+BATCH_SIZE = 128  # High batch size for stable ArcFace
+EPOCHS = 40       # Full training cycle
+LR = 1e-4         # Standard stable LR
 
-# File Paths
-DATA_DIR = "./data/LibriSpeech/train-clean-360"
-CHECKPOINT_PATH = "ecapa_master.h5" # Saves best model here
-LOG_DIR = "logs"
+SAVE_PATH = "ecapa_master.h5"
 
-# Learning Params
-INITIAL_LR = 0.0001 # Standard start
-CLIP_NORM = 3.0     # Safety rail (Prevents explosion, allows learning)
+# --- 1. ROBUST DATASET ---
+def get_dataset_info():
+    print("📂 Indexing Data...")
+    data_path = "./data/LibriSpeech/train-clean-360"
+    files = []
+    labels = []
+    
+    speakers = sorted([d for d in os.listdir(data_path) if not d.startswith('.')])
+    label_map = {spk: i for i, spk in enumerate(speakers)}
+    NUM_CLASSES = len(speakers)
+    
+    for spk in speakers:
+        spk_dir = os.path.join(data_path, spk)
+        for root, dirs, f_names in os.walk(spk_dir):
+            for f in f_names:
+                if f.endswith(".flac"):
+                    files.append(os.path.join(root, f))
+                    labels.append(label_map[spk])
+    
+    # Shuffle now to ensure mixing
+    c = list(zip(files, labels))
+    random.shuffle(c)
+    files, labels = zip(*c)
+    
+    print(f"✅ Found {len(files)} files | {NUM_CLASSES} Speakers")
+    return list(files), list(labels), NUM_CLASSES
 
-# --- ARMORED PREPROCESSING ---
-def augment_audio_signal(y, sr):
-    """Apply augmentation only if audio is valid"""
-    # 1. Noise
-    if random.random() > 0.6:
-        noise_amp = 0.001 * np.random.uniform() * np.amax(y)
-        y = y + noise_amp * np.random.normal(size=y.shape[0])
-    # 2. Time Stretch
+def augment_audio(y, sr):
+    # Gentle augmentation to prevent overfitting
     if random.random() > 0.7:
-        rate = random.uniform(0.95, 1.05)
-        y = librosa.effects.time_stretch(y, rate=rate)
+        noise = np.random.normal(0, 0.001, len(y))
+        y = y + noise
     return y
 
-def preprocess_pipeline(path, augment=False):
+def preprocess(path, augment=False):
     try:
         y, sr = librosa.load(path, sr=SAMPLE_RATE)
-        
-        # 1. Silence Check (Reject if mostly empty)
+        # 1. Silence Check
         if np.max(np.abs(y)) < 0.005: return None
         
-        if augment: y = augment_audio_signal(y, sr)
+        if augment: y = augment_audio(y, sr)
         
-        # 2. Length Check/Pad
-        target_len = int(sr * DURATION)
-        if len(y) > target_len:
-            start = random.randint(0, len(y) - target_len)
-            y = y[start:start+target_len]
+        # 2. Length Check
+        target = int(SAMPLE_RATE * DURATION)
+        if len(y) > target:
+            start = random.randint(0, len(y) - target)
+            y = y[start:start+target]
         else:
-            y = np.pad(y, (0, target_len - len(y)))
+            y = np.pad(y, (0, target - len(y)))
             
-        # 3. MFCC & NaN Check
         mfcc = librosa.feature.mfcc(y=y, sr=SAMPLE_RATE, n_mfcc=N_MFCC).T
-        if np.isnan(mfcc).any(): return None # Reject NaNs
-        
-        # 4. Normalize
         mfcc = (mfcc - np.mean(mfcc, axis=0)) / (np.std(mfcc, axis=0) + 1e-8)
         
-        # 5. Shape Check
         if mfcc.shape[0] < MAX_LEN:
             mfcc = np.pad(mfcc, ((0, MAX_LEN - mfcc.shape[0]), (0, 0)))
         else:
             mfcc = mfcc[:MAX_LEN, :]
             
+        # 3. NaN Check
+        if np.isnan(mfcc).any(): return None
         return mfcc.astype(np.float32)
     except:
-        return None # Catch generic file errors
+        return None
 
-# --- ARMORED GENERATOR ---
-def triplet_generator(speaker_dict, batch_size=32, augment=False):
-    speakers = list(speaker_dict.keys())
+def train_generator(files, labels, batch_size, n_classes):
+    idx = 0
     while True:
-        a_batch, p_batch, n_batch = [], [], []
-        # Keep looping until we fill the batch with VALID data
-        while len(a_batch) < batch_size:
-            spk_pos = random.choice(speakers)
-            if len(speaker_dict[spk_pos]) < 2: continue
-            
-            file_a, file_p = random.sample(speaker_dict[spk_pos], 2)
-            
-            spk_neg = random.choice(speakers)
-            while spk_neg == spk_pos: spk_neg = random.choice(speakers)
-            file_n = random.choice(speaker_dict[spk_neg])
-
-            # Process & Check Validity
-            a = preprocess_pipeline(file_a, augment=augment)
-            if a is None: continue
-            
-            p = preprocess_pipeline(file_p, augment=augment)
-            if p is None: continue
-            
-            n = preprocess_pipeline(file_n, augment=augment)
-            if n is None: continue
-            
-            a_batch.append(a); p_batch.append(p); n_batch.append(n)
+        batch_x = []
+        batch_y = [] # Indices
+        batch_y_hot = [] # OneHot
         
-        yield [np.array(a_batch), np.array(p_batch), np.array(n_batch)], np.zeros((batch_size,))
+        while len(batch_x) < batch_size:
+            if idx >= len(files):
+                idx = 0
+                # reshuffle
+                c = list(zip(files, labels))
+                random.shuffle(c)
+                files, labels = zip(*c)
+            
+            f = files[idx]
+            l = labels[idx]
+            idx += 1
+            
+            x = preprocess(f, augment=True)
+            if x is None: continue
+            
+            batch_x.append(x)
+            batch_y.append(l)
+            batch_y_hot.append(tf.keras.utils.to_categorical(l, n_classes))
+            
+        # Inputs: [Audio, Labels] (Labels used for ArcFace Angle calc)
+        # Outputs: OneHot (Used for CrossEntropy)
+        yield [np.array(batch_x), np.array(batch_y_hot)], np.array(batch_y_hot)
 
-def create_val_set(speaker_dict, n=1000):
-    print(f"🔨 Generating Fixed Validation Set ({n} triplets)...")
-    gen = triplet_generator(speaker_dict, batch_size=n, augment=False)
-    return next(gen)
+# --- 2. VALIDATION CALLBACK ---
+# This calculates the REAL verification accuracy (Pair matching)
+class VerificationCallback(tf.keras.callbacks.Callback):
+    def __init__(self, val_files, val_labels):
+        super().__init__()
+        self.val_files = val_files
+        self.val_labels = val_labels
+        self.encoder_model = None # Set later
 
-def identity_loss(y_true, y_pred): return tf.reduce_mean(y_pred)
+    def on_epoch_end(self, epoch, logs=None):
+        if self.encoder_model is None:
+            # Extract the encoder part from the full model
+            # The full model input is [audio, label], we want just [audio]
+            input_layer = self.model.layers[0].input 
+            # We need to find the ECAPA output. 
+            # In our build function, layer index 1 is usually the encoder
+            encoder_layer = self.model.get_layer("ECAPA_Encoder")
+            self.encoder_model = encoder_layer
+        
+        # Test 1000 pairs
+        same_count = 0
+        diff_count = 0
+        correct = 0
+        total = 500
+        
+        # Pre-compute embeddings for speed would be better, but this is simpler
+        # We'll just grab random batches
+        
+        pos_dists = []
+        neg_dists = []
+        
+        for i in range(total):
+            # Pos Pair
+            idx = random.randint(0, len(self.val_files)-1)
+            f1, l1 = self.val_files[idx], self.val_labels[idx]
+            # Find match
+            attempts = 0
+            while True:
+                idx2 = random.randint(0, len(self.val_files)-1)
+                if self.val_labels[idx2] == l1:
+                    f2 = self.val_files[idx2]
+                    break
+                attempts += 1
+                if attempts > 100: break # Give up
+            
+            x1 = preprocess(f1)
+            x2 = preprocess(f2)
+            if x1 is None or x2 is None: continue
+            
+            # Predict
+            v1 = self.encoder_model(x1[np.newaxis, ...], training=False)
+            v2 = self.encoder_model(x2[np.newaxis, ...], training=False)
+            
+            # Cosine Distance
+            v1 = tf.nn.l2_normalize(v1, axis=1)
+            v2 = tf.nn.l2_normalize(v2, axis=1)
+            dist = 1.0 - tf.reduce_sum(v1 * v2)
+            pos_dists.append(dist)
+            
+            # Neg Pair
+            while True:
+                idx3 = random.randint(0, len(self.val_files)-1)
+                if self.val_labels[idx3] != l1:
+                    f3 = self.val_files[idx3]
+                    break
+            
+            x3 = preprocess(f3)
+            v3 = self.encoder_model(x3[np.newaxis, ...], training=False)
+            v3 = tf.nn.l2_normalize(v3, axis=1)
+            dist_n = 1.0 - tf.reduce_sum(v1 * v3)
+            neg_dists.append(dist_n)
+
+        # Threshold Calculation (Simple EER approx)
+        thresholds = np.arange(0, 2.0, 0.05)
+        best_acc = 0
+        best_thresh = 0
+        
+        pos_dists = np.array(pos_dists)
+        neg_dists = np.array(neg_dists)
+        
+        for t in thresholds:
+            tp = np.sum(pos_dists < t)
+            tn = np.sum(neg_dists >= t)
+            acc = (tp + tn) / (len(pos_dists) + len(neg_dists))
+            if acc > best_acc:
+                best_acc = acc
+                best_thresh = t
+                
+        print(f"\n📊 [Verification] Best Acc: {best_acc*100:.2f}% | Thresh: {best_thresh:.2f}")
+        logs['val_verification_acc'] = best_acc
+
+# --- 3. ARCFACE LAYER ---
+class ArcFace(tf.keras.layers.Layer):
+    def __init__(self, n_classes=10, s=30.0, m=0.50, regularizer=None, **kwargs):
+        super(ArcFace, self).__init__(**kwargs)
+        self.n_classes = n_classes
+        self.s = s
+        self.m = m
+        self.regularizer = tf.keras.regularizers.get(regularizer)
+
+    def build(self, input_shape):
+        embedding_shape = input_shape[0]
+        self.W = self.add_weight(name='W',
+                                shape=(embedding_shape[-1], self.n_classes),
+                                initializer='glorot_uniform',
+                                trainable=True,
+                                regularizer=self.regularizer)
+        super(ArcFace, self).build(input_shape)
+
+    def call(self, inputs):
+        x, y = inputs
+        x = tf.nn.l2_normalize(x, axis=1)
+        W = tf.nn.l2_normalize(self.W, axis=0)
+        logits = tf.matmul(x, W)
+        logits = tf.clip_by_value(logits, -0.999, 0.999)
+        theta = tf.math.acos(logits)
+        target_logits = tf.math.cos(theta + self.m)
+        logits = logits * self.s
+        target_logits = target_logits * self.s
+        out = logits * (1 - y) + target_logits * y
+        return out
+
+# --- 4. BUILD MODEL ---
+def build_arcface_model(n_classes):
+    # Base
+    base_model = build_siamese_model((MAX_LEN, N_MFCC))
+    encoder = base_model.get_layer("ECAPA_Encoder")
+    
+    # Inputs
+    audio_inp = tf.keras.layers.Input(shape=(MAX_LEN, N_MFCC))
+    label_inp = tf.keras.layers.Input(shape=(n_classes,))
+    
+    # Graph
+    emb = encoder(audio_inp)
+    
+    # Head
+    output = ArcFace(n_classes=n_classes)([emb, label_inp])
+    output = tf.keras.layers.Softmax()(output)
+    
+    return tf.keras.Model([audio_inp, label_inp], output)
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print(f"🚀 TensorFlow Version: {tf.__version__}")
+    # Get Data
+    files, labels, n_classes = get_dataset_info()
     
-    # 1. Data Indexing
-    print("📂 Indexing Dataset...")
-    speaker_dict = {}
-    for root, dirs, files in os.walk(DATA_DIR):
-        for f in files:
-            if f.endswith(".flac"):
-                spk = root.split(os.sep)[-2]
-                if spk not in speaker_dict: speaker_dict[spk] = []
-                speaker_dict[spk].append(os.path.join(root, f))
+    # Split
+    split = int(len(files) * 0.9)
+    train_files, val_files = files[:split], files[split:]
+    train_labels, val_labels = labels[:split], labels[split:]
     
-    speaker_dict = {k: v for k, v in speaker_dict.items() if len(v) >= 2}
+    # Build
+    print("🏗️  Building ArcFace from Scratch...")
+    model = build_arcface_model(n_classes)
     
-    # 2. Deterministic Split (Sort keys to prevent leakage)
-    keys = list(speaker_dict.keys())
-    keys.sort() 
-    
-    val_keys = set(keys[::10]) # 10% val
-    train_dict = {k: v for k, v in speaker_dict.items() if k not in val_keys}
-    val_dict = {k: v for k, v in speaker_dict.items() if k in val_keys}
-    
-    print(f"📊 Train Speakers: {len(train_dict)} | Val Speakers: {len(val_dict)}")
-    val_data = create_val_set(val_dict, n=1500)
-
-    # 3. Model Setup (Auto-Resume)
-    model = build_siamese_model((MAX_LEN, N_MFCC))
-    
-    if os.path.exists(CHECKPOINT_PATH):
-        print(f"♻️  Found Checkpoint: {CHECKPOINT_PATH}. Resuming...")
-        try:
-            # Load weights ONLY (safer than loading full model)
-            model.load_weights(CHECKPOINT_PATH)
-            print("✅ Weights loaded.")
-        except Exception as e:
-            print(f"⚠️  Checkpoint load failed: {e}. Starting fresh.")
-    else:
-        print("✨ No checkpoint found. Starting fresh.")
-
-    # 4. Compile with Safety Rails
-    print(f"🛡️  Compiling with ClipNorm={CLIP_NORM}")
-    optimizer = tf.keras.optimizers.legacy.Adam(
-        learning_rate=INITIAL_LR,
-        clipnorm=CLIP_NORM
+    model.compile(
+        optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=LR),
+        loss='categorical_crossentropy',
+        metrics=['accuracy'] # This is class accuracy
     )
-    model.compile(loss=identity_loss, optimizer=optimizer)
-
-    # 5. Callbacks
+    
+    # Callbacks
     callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(CHECKPOINT_PATH, save_best_only=True, monitor='val_loss', verbose=1),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, verbose=1),
-        tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)
+        tf.keras.callbacks.ModelCheckpoint(SAVE_PATH, save_best_only=True, monitor='val_verification_acc', mode='max', verbose=1),
+        VerificationCallback(val_files, val_labels),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor='loss', patience=3, verbose=1)
     ]
-
-    # 6. Train
+    
+    # Train
     print("🔥 Starting Training...")
-    try:
-        model.fit(
-            triplet_generator(train_dict, BATCH_SIZE, augment=True),
-            validation_data=val_data,
-            steps_per_epoch=PAIRS_PER_EPOCH // BATCH_SIZE,
-            epochs=EPOCHS,
-            callbacks=callbacks
-        )
-    except KeyboardInterrupt:
-        print("\n🛑 Training Interrupted by User.")
-        
+    model.fit(
+        train_generator(train_files, train_labels, BATCH_SIZE, n_classes),
+        steps_per_epoch=len(train_files) // BATCH_SIZE,
+        epochs=EPOCHS,
+        callbacks=callbacks
+    )
     print("✅ Done.")
