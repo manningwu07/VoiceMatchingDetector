@@ -11,13 +11,62 @@ SAMPLE_RATE = 16000
 N_MFCC = 80
 MAX_LEN = 130
 BATCH_SIZE = 64
+DATA_DIR = "./data/LibriSpeech/train-clean-360"
 
+# --- ARCFACE SUPPORT ---
+# We need this class definition to reconstruct the model for loading
+
+class ArcFace(tf.keras.layers.Layer):
+    def __init__(self, n_classes=10, s=30.0, m=0.50, regularizer=None, **kwargs):
+        super(ArcFace, self).__init__(**kwargs)
+        self.n_classes = n_classes
+        self.s = s
+        self.m = m
+        self.regularizer = tf.keras.regularizers.get(regularizer)
+
+    def build(self, input_shape):
+        embedding_shape = input_shape[0]
+        self.W = self.add_weight(name='W',
+                                shape=(embedding_shape[-1], self.n_classes),
+                                initializer='glorot_uniform',
+                                trainable=True,
+                                regularizer=self.regularizer)
+        super(ArcFace, self).build(input_shape)
+
+    def call(self, inputs):
+        x, y = inputs
+        # FIX: We must return a Tensor, not a list, so Softmax works.
+        # We perform the matmul to ensure the shape is (batch_size, n_classes)
+        # and to ensure 'W' is included in the computation graph for weight loading.
+        return tf.matmul(x, self.W)
+
+def get_num_classes(data_dir):
+    # We must match the class count exactly to load weights
+    speakers = [d for d in os.listdir(data_dir) if not d.startswith('.')]
+    return len(speakers)
+
+def build_reconstruction(n_classes):
+    # Rebuild the EXACT architecture from train_master.py
+    base_model = build_siamese_model((MAX_LEN, N_MFCC))
+    encoder = base_model.get_layer("ECAPA_Encoder")
+    
+    audio_inp = tf.keras.layers.Input(shape=(MAX_LEN, N_MFCC))
+    label_inp = tf.keras.layers.Input(shape=(n_classes,))
+    
+    emb = encoder(audio_inp)
+    
+    # We reconstruct the head just to satisfy the weight loader
+    output = ArcFace(n_classes=n_classes)([emb, label_inp])
+    output = tf.keras.layers.Softmax()(output)
+    
+    model = tf.keras.Model([audio_inp, label_inp], output)
+    return model
+
+# --- EVALUATION LOGIC ---
 def preprocess_tta(path):
     """Returns a batch of variations for a single file"""
     try:
         y_raw, _ = librosa.load(path, sr=SAMPLE_RATE)
-        y_raw, _ = librosa.effects.trim(y_raw, top_db=20)
-        
         # 1. Base crop (Center)
         target = int(SAMPLE_RATE * 3.0)
         if len(y_raw) > target:
@@ -51,11 +100,25 @@ def preprocess_tta(path):
         return np.zeros((2, MAX_LEN, N_MFCC), dtype=np.float32)
 
 def evaluate(model_path, data_dir, num_pairs=2000):
-    print(f"🏗️  Reconstructing Model...")
-    full_model = build_siamese_model((MAX_LEN, N_MFCC))
-    full_model.load_weights(model_path)
+    print(f"🏗️  Reconstructing ArcFace Model...")
+    
+    # 1. Determine shape
+    n_classes = get_num_classes(data_dir)
+    print(f"   Detected {n_classes} classes/speakers.")
+    
+    # 2. Build and Load
+    full_model = build_reconstruction(n_classes)
+    try:
+        full_model.load_weights(model_path)
+        print("✅ Weights loaded successfully.")
+    except Exception as e:
+        print(f"❌ Error loading weights: {e}")
+        return
+
+    # 3. Extract Encoder
     encoder = full_model.get_layer("ECAPA_Encoder")
     
+    # 4. Data Indexing
     print("📂 Indexing Speakers...")
     speaker_dict = {}
     for root, dirs, files in os.walk(data_dir):
@@ -67,6 +130,7 @@ def evaluate(model_path, data_dir, num_pairs=2000):
     
     speaker_dict = {k: v for k, v in speaker_dict.items() if len(v) >= 2}
     speakers = list(speaker_dict.keys())
+    # Use the validation split (every 10th speaker)
     val_keys = speakers[::10]
     
     print(f"🧪 Testing on {len(val_keys)} speakers ({num_pairs} pairs) using TTA...")
@@ -103,7 +167,9 @@ def evaluate(model_path, data_dir, num_pairs=2000):
         v1 = v1 / np.linalg.norm(v1)
         v2 = v2 / np.linalg.norm(v2)
         
-        dist = np.linalg.norm(v1 - v2)
+        # Cosine Distance
+        dist = 1.0 - np.dot(v1, v2)
+        
         dists.append(dist)
         labels.append(label)
 
@@ -112,7 +178,11 @@ def evaluate(model_path, data_dir, num_pairs=2000):
     labels = np.array(labels)
     best_acc = 0
     best_thresh = 0
-    for t in np.arange(0.1, 1.5, 0.05):
+    
+    # Scan thresholds from 0.0 to 1.0
+    for t in np.arange(0.0, 1.0, 0.01):
+        # In cosine distance: 0 is same, 1 is different.
+        # So if dist < t, we predict SAME (1).
         preds = (dists < t).astype(int)
         acc = np.mean(preds == labels)
         if acc > best_acc:
@@ -126,4 +196,4 @@ def evaluate(model_path, data_dir, num_pairs=2000):
     print("="*30)
 
 if __name__ == "__main__":
-    evaluate("ecapa_hard_mining.h5", "./data/LibriSpeech/train-clean-360")
+    evaluate("ecapa_master.h5", DATA_DIR)
